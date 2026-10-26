@@ -22,6 +22,7 @@ local config          = {
     padding_x              = 14,
     padding_y              = 7,
     max_len                = 38,
+    font_scale             = 1.0,
     bar_width              = 3,
     bar_min_height         = 50,
     hide_loaded_subtitle   = false,
@@ -31,11 +32,13 @@ local config          = {
     use_timestamp          = false
 }
 local offset          = 1
+local browsing        = false
 local currentIndex    = 0
 local subtitles       = {}
 local tempSubtitles   = {}
 local sidebarEnabled  = false
 local search          = {enabled = false, refresh = false, timer = nil, resultTimer = nil, processing = false,}
+local drag            = {active = false, hover = false, offset = 0}
 local data            = {}
 local currentSubtitle = {}
 local customThemes    = {}
@@ -57,6 +60,25 @@ local colors          = {
 local overlay         = mp.create_osd_overlay("ass-events")
 
 options.read_options(config, "sidebarsubtitles")
+
+local function clampScale(scale)
+
+    return math.max(0.7, math.min(2.5, scale))
+end
+
+local fontScale = clampScale(config.font_scale)
+
+--the sidebar width changes at runtime by dragging its left edge, config.max_len is the char count at defaultWidth
+
+local defaultWidth  = 315
+local minWidth      = 200
+local maxWidthRatio = 0.7
+local grabWidth     = 6
+local sidebarWidth  = config.width
+
+--the cached ASS file has centisecond times while sub-start has the source time, so a cue matches its start within this many seconds
+
+local startTolerance = 0.02
 
 local function getSubtitleInfo(subtitleType)
 
@@ -194,9 +216,13 @@ local function reset()
     subtitles         = {}
     tempSubtitles     = {}
     offset            = 1
+    browsing          = false
     currentIndex      = 0
     currentSubtitle   = {}
+    search.enabled    = false
     search.processing = false
+    drag.active       = false
+    drag.hover        = false
     mouse             = {x = 0, y = 0}
 end
 
@@ -234,7 +260,9 @@ end
 
 local function truncate(str, breakingPoint)
 
-    if not breakingPoint and config.max_len > utf8.len(str) then return str end
+    local maxLen = math.max(1, math.floor(config.max_len * (sidebarWidth / defaultWidth) / fontScale))
+
+    if not breakingPoint and maxLen > utf8.len(str) then return str end
 
     local n         = 0
     local inTags    = false
@@ -258,7 +286,7 @@ local function truncate(str, breakingPoint)
 
             if breakingPoint and breakingPoint > 0 then
 
-                if k == config.max_len + 1 then deleteThis = true end
+                if k == maxLen + 1 then deleteThis = true end
 
                 if k == breakingPoint and l == 1 then
 
@@ -268,7 +296,7 @@ local function truncate(str, breakingPoint)
                 end
             else
 
-                if k == config.max_len + 1 then
+                if k == maxLen + 1 then
 
                     if l == 1 then k = 1 end
 
@@ -327,7 +355,7 @@ local function highlighter(str, selected)
     local searchedText = utf8.lower(input.get_text())
     local matches      = {}
 
-    for si, li in utf8.gfind(text, searchedText) do
+    for si, li in utf8.gfind(text, (searchedText:gsub("%p", "%%%0"))) do
 
         table.insert(matches, {startIndex = si, lastIndex = li})
     end
@@ -349,7 +377,9 @@ local function highlighter(str, selected)
             preTags = string.format("{\\c&H%s&}", colors.highlight)
 
             if selected then preTags = preTags.."{\\bord1\\3c&H000000&\\blur1}" end
-        elseif matches[m].lastIndex == n then
+        end
+
+        if matches[m].lastIndex == n then
 
             postTags = string.format("{\\c&H%s&}", selected and colors.rowSelectedText or colors.rowText)
 
@@ -363,13 +393,13 @@ local function highlighter(str, selected)
     return content
 end
 
-local function updateOverlay(content, x, y)
+local function updateOverlay(content)
 
     if overlay.data == content and overlay.res_x == data.screenWidth and overlay.res_y == data.screenHeight then return end
 
     overlay.data  = content
-    overlay.res_x = (x and x > 0) and x or data.screenWidth
-    overlay.res_y = (y and y > 0) and x or data.screenHeight
+    overlay.res_x = data.screenWidth
+    overlay.res_y = data.screenHeight
     overlay.z     = 2000
 
     overlay:update()
@@ -401,7 +431,7 @@ local function drawSidebar()
     ass:pos(data.videoWidth, 0)
     ass:append(string.format("{\\bord0\\1c&H%s&}", colors.background))
     ass:draw_start()
-    ass:rect_cw(0, 0, config.width, data.screenHeight)
+    ass:rect_cw(0, 0, sidebarWidth, data.screenHeight)
     ass:draw_stop()
 
     --no results found
@@ -417,7 +447,7 @@ local function drawSidebar()
     --search
 
     local searchBoxX, searchBoxY = data.videoWidth + config.padding_x, config.padding_y
-    local searchBoxW, searchBoxH = config.width - config.padding_x * 2, data.searchBoxHeight
+    local searchBoxW, searchBoxH = sidebarWidth - config.padding_x * 2, data.searchBoxHeight
     local searchTextAreaWidth    = searchBoxW - data.searchBoxPaddingX * 2
 
     input.calculate_offset(data.screenWidth, data.screenHeight, searchTextAreaWidth)
@@ -477,7 +507,7 @@ local function drawSidebar()
         --icon
 
         ass:new_event()
-        ass:pos(searchBoxX + config.width - config.padding_x * 2 - 33, config.padding_y + 7)
+        ass:pos(searchBoxX + sidebarWidth - config.padding_x * 2 - 33, config.padding_y + data.searchBoxHeight / 2 - 8)
         ass:append(string.format("{\\bord0\\1c&H%s&\\fs7\\p1\\fscx40\\fscy40}", colors.searchText))
         ass:append("m 16 0 b 24 0 32 8 32 16 b 32 24 24 32 16 32 b 8 32 0 24 0 16 b 0 8 8 0 16 0 m 30 28 l 25 32 l 33 40 l 38 36 m 6 16 b 6 22 10 26 16 26 b 22 26 26 22 26 16 b 26 10 22 6 16 6 b 10 6 6 10 6 16")
     end
@@ -498,7 +528,7 @@ local function drawSidebar()
            ass:pos(data.videoWidth, lineY)
            ass:append(string.format("{\\bord0\\1c&H%s&}", colors.rowBorder))
            ass:draw_start()
-           ass:rect_cw(0, 0, config.width, data.borderHeight)
+           ass:rect_cw(0, 0, sidebarWidth, data.borderHeight)
            ass:draw_stop()
         end
 
@@ -512,7 +542,7 @@ local function drawSidebar()
             ass:pos(data.videoWidth, lineY + data.borderHeight)
             ass:append(string.format("{\\bord0\\1c&H%s&}", colors.rowSelected))
             ass:draw_start()
-            ass:rect_cw(0, 0, config.width, data.lineHeight - data.borderHeight)
+            ass:rect_cw(0, 0, sidebarWidth, data.lineHeight - data.borderHeight)
             ass:draw_stop()
 
             --icon
@@ -531,13 +561,13 @@ local function drawSidebar()
 
             --hover
 
-            if not search.processing and mouse.y and mouse.y > lineY and mouse.y < lineY + data.lineHeight then
+            if not search.processing and not drag.active and mouse.x >= data.videoWidth and mouse.y and mouse.y > lineY and mouse.y < lineY + data.lineHeight then
 
                 ass:new_event()
                 ass:pos(data.videoWidth, lineY + data.borderHeight)
                 ass:append(string.format("{\\bord0\\1c&H%s&}", selected and colors.rowSelected or colors.rowHover))
                 ass:draw_start()
-                ass:rect_cw(0, 0, config.width, data.lineHeight - data.borderHeight)
+                ass:rect_cw(0, 0, sidebarWidth, data.lineHeight - data.borderHeight)
                 ass:draw_stop()
             end
         end
@@ -553,7 +583,7 @@ local function drawSidebar()
         ass:append(string.format("#%d", i))
 
         ass:new_event()
-        ass:pos(data.videoWidth + config.width - config.padding_x, lineY + config.padding_y)
+        ass:pos(data.videoWidth + sidebarWidth - config.padding_x, lineY + config.padding_y)
         ass:append(string.format("{\\b0\\an9\\bord0\\1c&H%s&\\fs%s}", selected and colors.rowSelectedText or colors.rowUpperText, data.topFontSize))
 
         if search.processing then ass:append("{\\alpha&HC8&}") end
@@ -584,7 +614,7 @@ local function drawSidebar()
     if #subtitles > data.lineCount then
 
         lineY            = data.screenHeight - data.contentArea + data.borderHeight
-        local barX       = data.videoWidth + config.width - config.bar_width
+        local barX       = data.videoWidth + sidebarWidth - config.bar_width
         local barHeight  = math.max(data.maxOffset * 0.1, config.bar_min_height)
         local barY       = (data.contentArea - barHeight - data.borderHeight) * ((offset - 1) / (data.maxOffset - 1))
 
@@ -596,21 +626,38 @@ local function drawSidebar()
         ass:draw_stop()
     end
 
+    --resize handle
+
+    if drag.hover or drag.active then
+
+        ass:new_event()
+        ass:pos(data.videoWidth, 0)
+        ass:append(string.format("{\\1c&H%s&\\bord0}", colors.scroll))
+        ass:draw_start()
+        ass:rect_cw(0, 0, config.bar_width, data.screenHeight)
+        ass:draw_stop()
+    end
+
     updateOverlay(ass.text)
+end
+
+local function scaled(size)
+
+    return math.floor(size * fontScale + 0.5)
 end
 
 local function fillData()
 
     data.searchBoxPaddingX              = 20
-    data.searchBoxPaddingY              = 7
-    data.searchBoxHeight                = 30
-    data.searchFontSize                 = 17
-    data.topFontSize                    = 13
-    data.bottomFontSize                 = 17
+    data.searchBoxPaddingY              = scaled(7)
+    data.searchBoxHeight                = scaled(30)
+    data.searchFontSize                 = scaled(17)
+    data.topFontSize                    = scaled(13)
+    data.bottomFontSize                 = scaled(17)
     data.lineMargin                     = 5
     data.borderHeight                   = 1
     data.screenWidth, data.screenHeight = mp.get_osd_size()
-    data.videoWidth                     = data.screenWidth - config.width
+    data.videoWidth                     = data.screenWidth - sidebarWidth
     data.lineHeight                     = data.topFontSize + data.bottomFontSize * 2 + data.lineMargin + config.padding_y * 2
     data.contentArea                    = data.screenHeight - (data.searchBoxHeight + config.padding_y * 2)
     data.lineCount                      = math.floor(data.contentArea / data.lineHeight)
@@ -635,14 +682,33 @@ local function detectUOSC()
     return false
 end
 
+local function setVideoMargin()
+
+    mp.commandv("set", "video-margin-ratio-right", sidebarWidth / data.screenWidth)
+
+    if customThemes.uosc then mp.commandv('script-message-to', 'uosc', 'sidebarsubtitles', data.videoWidth) end
+end
+
+--a press and drag over the sidebar would move a borderless window instead of reaching the bindings
+
+local function setWindowDragging(allow)
+
+    local value = allow and defaultWindowDragging or "no"
+
+    if mp.get_property("window-dragging") ~= value then mp.set_property("window-dragging", value) end
+end
+
 local function togglePlayerControls()
 
     if defaultSubMargin == nil then defaultSubMargin = mp.get_property("sub-use-margins") end
+    if defaultVideoMargin == nil then defaultVideoMargin = mp.get_property_number("video-margin-ratio-right", 0) end
+    if defaultWindowDragging == nil then defaultWindowDragging = mp.get_property("window-dragging") end
 
     if sidebarEnabled then
 
+        setWindowDragging(true)
         mp.set_property("sub-use-margins", defaultSubMargin)
-        mp.commandv("set", "video-margin-ratio-right", 0)
+        mp.commandv("set", "video-margin-ratio-right", defaultVideoMargin)
 
         if customThemes.uosc then
 
@@ -655,17 +721,54 @@ local function togglePlayerControls()
     else
 
         mp.set_property("sub-use-margins", "no")
-        mp.commandv("set", "video-margin-ratio-right", config.width / data.screenWidth)
+        setVideoMargin()
 
-        if customThemes.uosc then
-
-            mp.commandv('script-message-to', 'uosc', 'sidebarsubtitles', data.videoWidth)
-
-        else
+        if not customThemes.uosc then
 
             mp.command("script-message osc-visibility never")
         end
     end
+end
+
+local function findIndexByStart(startTime)
+
+    local index   = 0
+    local nearest = startTolerance
+
+    for i, subtitle in ipairs(subtitles) do
+
+        local distance = math.abs(subtitle.startTime - startTime)
+
+        if distance < nearest then
+
+            index   = i
+            nearest = distance
+        end
+    end
+
+    return index
+end
+
+--selects the cue that starts at startTime (default: the playing one) and centers it, the caller draws
+--a filtered list or a list the user scrolled only gets the selection, its position stays
+
+local function syncCurrentLine(startTime)
+
+    if drag.active or search.enabled or search.processing then return false end
+
+    startTime = startTime or mp.get_property_number(currentSubtitle.group == "p" and "sub-start" or "secondary-sub-start")
+
+    local index = startTime and findIndexByStart(startTime) or 0
+
+    if index == 0 then return false end
+
+    currentIndex = index
+
+    if #tempSubtitles > 0 or browsing then return true end
+
+    offset = math.max(1, math.min(data.maxOffset, index - math.floor((data.lineCount - 1) / 2)))
+
+    return true
 end
 
 local function initSidebar()
@@ -685,6 +788,7 @@ local function initSidebar()
 
         setBindings("sidebar")
         togglePlayerControls()
+        syncCurrentLine()
         drawSidebar()
 
         if config.hide_loaded_subtitle then
@@ -701,11 +805,17 @@ local function initSidebar()
         end
     else
 
+        --an active search must not outlive the sidebar, its bindings and timers would reach the next one
+
+        if search.enabled then unsetBindings("search") end
+        if search.timer then search.timer:kill() end
+        if search.resultTimer then search.resultTimer:kill() end
+
         input.reset()
         utf8.reset()
 
         unsetBindings("sidebar")
-        updateOverlay("", 0, 0)
+        updateOverlay("")
         togglePlayerControls()
 
         if config.hide_loaded_subtitle then
@@ -731,8 +841,7 @@ end
 
 local function tryGetSubtitles()
 
-    local isWindows = package.config:sub(1, 1) ~= '/'
-    local merged    = false
+    local merged = false
     local file
 
     if currentSubtitle.title == "merged.ass" then
@@ -745,25 +854,20 @@ local function tryGetSubtitles()
 
         if currentSubtitle.external then
 
-            local sourceFile = currentSubtitle.filename
-            local targetFile = getPath("subtitlefile")
-
             if currentSubtitle.codec == "ass" then
 
-                if isWindows then
+                file = io.open(currentSubtitle.filename, "r")
+            else
 
-                    runCommand({"powershell", "-NoProfile", "-Command", string.format("Copy-Item -LiteralPath \"%s\" -Destination \"%s\" -Force", sourceFile, targetFile)})
-                else
+                local targetFile = getPath("subtitlefile")
+                local result     = runCommand({"ffmpeg", "-y", "-i", currentSubtitle.filename, "-c:s", "ass", targetFile})
 
-                    runCommand({"cp", sourceFile, targetFile})
-                end
-            elseif currentSubtitle.codec == "subrip" then
-
-                runCommand({"ffmpeg", "-i", sourceFile, "-c:s", "ass", targetFile})
+                if result.status == 0 then file = io.open(targetFile, "r") end
             end
-        end
+        else
 
-        file = io.open(getPath("subtitlefile"), "r")
+            file = io.open(getPath("subtitlefile"), "r")
+        end
     end
 
     if not file then
@@ -775,6 +879,8 @@ local function tryGetSubtitles()
 
     local content  = file:read("*all")
     local prevLine = {}
+
+    file:close()
 
     for line in content:gmatch("Dialogue:[^\n]+") do
 
@@ -826,7 +932,11 @@ local function initSidebarWhenSubtitlesLoaded()
 
     if not os.rename(tempPath, tempPath) then
 
-        runCommand({"powershell", "-NoProfile", "-Command", "mkdir", tempPath})
+        if package.config:sub(1, 1) ~= '/' then
+            runCommand({"powershell", "-NoProfile", "-Command", "mkdir", tempPath})
+        else
+            runCommand({"mkdir", "-p", tempPath})
+        end
     end
 
     local ok
@@ -834,6 +944,13 @@ local function initSidebarWhenSubtitlesLoaded()
     ok = tryGetSubtitles()
 
     if ok then return end
+
+    if currentSubtitle.external then
+
+        currentSubtitle = {}
+
+        return
+    end
 
     mp.osd_message("Getting subtitle lines...", 9999)
 
@@ -865,6 +982,8 @@ local function initSidebarWhenSubtitlesLoaded()
 
     local onSubtitleFail = function (result)
 
+        currentSubtitle = {}
+
         if string.find(result, "No such file or directory") then
 
             mp.osd_message("No such file or directory.", 3)
@@ -883,7 +1002,7 @@ local function initSidebarWhenSubtitlesLoaded()
 
     runAsync(ffmpegCommand, function()
 
-        tryGetSubtitles()
+        if not tryGetSubtitles() then currentSubtitle = {} end
     end, onSubtitleFail)
 end
 
@@ -921,70 +1040,25 @@ local function toggleSidebar(subtitleType)
     initSidebar()
 end
 
-local function findIndexByTime()
-
-    local startTime = mp.get_property_number(currentSubtitle.group == "p" and "sub-start" or "secondary-sub-start")
-
-    if not startTime then return 0 end
-
-    local index = 0
-
-    --visible rows
-
-    if data.lineCount and data.lineCount > 0 then
-
-        for i = offset, offset + data.lineCount - 1 do
-
-            if math.floor(subtitles[i].startTime) == math.floor(startTime) then
-
-                index = i
-
-                break
-            end
-        end
-
-        if index > 0 then return index end
-    end
-
-    --fhe first row not shown on screen at the current offset
-
-    if subtitles[offset + data.lineCount] and math.floor(subtitles[offset + data.lineCount].startTime) == math.floor(startTime) then
-
-        index  = offset + data.lineCount
-        offset = index
-
-        return index
-    end
-
-    --last resort, searching from the beginning
-
-    for i in ipairs(subtitles) do
-
-        if math.floor(subtitles[i].startTime) == math.floor(startTime) then
-
-            index = i
-
-            break
-        end
-    end
-
-    if index > 0 then offset = index end
-
-    return index
-end
-
 local function mouseInSidebarSearch()
 
     mouse.x, mouse.y = mp.get_mouse_pos()
 
-    return mouse.x >= (data.videoWidth + config.padding_x) and mouse.x <= (data.videoWidth + config.width - config.padding_x) and mouse.y >= config.padding_y and mouse.y <= (config.padding_y + data.searchBoxHeight)
+    return mouse.x >= (data.videoWidth + config.padding_x) and mouse.x <= (data.videoWidth + sidebarWidth - config.padding_x) and mouse.y >= config.padding_y and mouse.y <= (config.padding_y + data.searchBoxHeight)
 end
 
 local function mouseInSidebar()
 
     mouse.x, mouse.y = mp.get_mouse_pos()
 
-    return mouse.x >= data.videoWidth and mouse.x <= data.videoWidth + config.width
+    return mouse.x >= data.videoWidth and mouse.x <= data.videoWidth + sidebarWidth
+end
+
+local function mouseInGrabZone()
+
+    mouse.x, mouse.y = mp.get_mouse_pos()
+
+    return mouse.x >= data.videoWidth - grabWidth and mouse.x <= data.videoWidth + grabWidth
 end
 
 local function searchResults()
@@ -1009,10 +1083,11 @@ local function searchResults()
     offset            = 1
     currentIndex      = 0
 
-    fillData()
-    drawSidebar()
-
     if #tempSubtitles == #subtitles then tempSubtitles = {} end
+
+    fillData()
+    syncCurrentLine()
+    drawSidebar()
 end
 
 local function enter()
@@ -1024,6 +1099,44 @@ local function enter()
     search.resultTimer = mp.add_timeout(3, searchResults)
 end
 
+local function refreshLayout()
+
+    --input.lua caches the text offset per text and cursor, so rebuild it for the new font size or width
+
+    local searchedText = input.get_text()
+
+    input.reset()
+    input.default(searchedText)
+
+    fillData()
+
+    input.font_size = data.searchFontSize
+    offset          = math.max(1, math.min(offset, data.maxOffset))
+
+    if not browsing then syncCurrentLine() end
+
+    drawSidebar()
+end
+
+local function zoomFont(step)
+
+    fontScale = clampScale(math.floor((fontScale + step) * 100 + 0.5) / 100)
+
+    refreshLayout()
+end
+
+local function resizeSidebar(width)
+
+    width = math.max(minWidth, math.min(math.floor(data.screenWidth * maxWidthRatio), width))
+
+    if width == sidebarWidth then return end
+
+    sidebarWidth = width
+
+    refreshLayout()
+    setVideoMargin()
+end
+
 local function bindingList(section)
 
     if section == "sidebar" then
@@ -1033,9 +1146,41 @@ local function bindingList(section)
             click = {
 
                 key  = "mbtn_left",
-                func = function ()
+                func = function (event)
 
                     if sidebarEnabled then
+
+                        --a press in the grab zone starts a resize drag and the release ends it, every other press is a click
+
+                        if event.event == "repeat" then return end
+
+                        if event.event == "up" then
+
+                            if drag.active then
+
+                                drag.active = false
+                                drag.hover  = mouseInGrabZone()
+
+                                if not browsing then syncCurrentLine() end
+
+                                drawSidebar()
+                            end
+
+                            return
+                        end
+
+                        if mouseInGrabZone() then
+
+                            if event.event == "down" then
+
+                                drag.active = true
+                                drag.offset = mouse.x - data.videoWidth
+
+                                drawSidebar()
+                            end
+
+                            return
+                        end
 
                         if not search.processing and mouseInSidebar() then
 
@@ -1046,6 +1191,7 @@ local function bindingList(section)
                                 if mouse.y and mouse.y > lineY and mouse.y < lineY + data.lineHeight then
 
                                     currentIndex = i
+                                    browsing     = false
 
                                     mp.commandv("seek", subtitles[i].startTime + 0.01, "absolute+exact")
 
@@ -1084,11 +1230,12 @@ local function bindingList(section)
 
                             if search.timer then search.timer:kill() end
 
+                            syncCurrentLine()
                             drawSidebar()
                         end
                     end
                 end,
-                opts = nil
+                opts = {complex = true}
             },
 
             scrollup = {
@@ -1099,6 +1246,8 @@ local function bindingList(section)
                     if sidebarEnabled and not search.processing and mouseInSidebar() then
 
                         if offset > 1 then offset = offset - 1 end
+
+                        browsing = true
 
                         drawSidebar()
                     end
@@ -1115,8 +1264,30 @@ local function bindingList(section)
 
                         if data.maxOffset and offset < data.maxOffset then offset = offset + 1 end
 
+                        browsing = true
+
                         drawSidebar()
                     end
+                end,
+                opts = nil
+            },
+
+            zoomin = {
+
+                key  = "ctrl+wheel_up",
+                func = function ()
+
+                    if sidebarEnabled and not search.processing and mouseInSidebar() then zoomFont(0.1) end
+                end,
+                opts = nil
+            },
+
+            zoomout = {
+
+                key  = "ctrl+wheel_down",
+                func = function ()
+
+                    if sidebarEnabled and not search.processing and mouseInSidebar() then zoomFont(-0.1) end
                 end,
                 opts = nil
             },
@@ -1150,39 +1321,47 @@ function unsetBindings(section)
     for name in pairs(bindingList(section)) do mp.remove_key_binding("sidebarsubtitles_"..section..name) end
 end
 
-mp.observe_property("sub-text", "native", function(_, text)
+--the start changes with every cue, even when two cues have the same text
 
-    if sidebarEnabled and not search.processing and currentSubtitle.group == "p" and text and text ~= "" and not mouseInSidebar() then
+mp.observe_property("sub-start", "number", function(_, startTime)
 
-        local foundedIndex = findIndexByTime()
-
-        if foundedIndex > 0 then
-
-            currentIndex = foundedIndex
-
-            drawSidebar()
-        end
-    end
+    if sidebarEnabled and currentSubtitle.group == "p" and startTime and syncCurrentLine(startTime) then drawSidebar() end
 end)
 
-mp.observe_property("secondary-sub-text", "native", function(_, text)
+mp.observe_property("secondary-sub-start", "number", function(_, startTime)
 
-    if sidebarEnabled and not search.processing and currentSubtitle.group == "s" and text and text ~= "" and not mouseInSidebar() then
-
-        local foundedIndex = findIndexByTime()
-
-        if foundedIndex > 0 then
-
-            currentIndex = foundedIndex
-
-            drawSidebar()
-        end
-    end
+    if sidebarEnabled and currentSubtitle.group == "s" and startTime and syncCurrentLine(startTime) then drawSidebar() end
 end)
 
-mp.observe_property("mouse-pos", "native", function()
+mp.observe_property("mouse-pos", "native", function(_, pos)
 
-    if sidebarEnabled and not search.processing and mouseInSidebar() then
+    if not sidebarEnabled then return end
+
+    if drag.active then
+
+        mouse.x, mouse.y = mp.get_mouse_pos()
+
+        resizeSidebar(data.screenWidth - (mouse.x - drag.offset))
+
+        return
+    end
+
+    local hover = mouseInGrabZone()
+
+    --a scrolled list follows playback again once the pointer leaves the sidebar
+
+    if browsing and not hover and (not mouseInSidebar() or (pos and pos.hover == false)) then
+
+        browsing = false
+
+        if syncCurrentLine() then drawSidebar() end
+    end
+
+    setWindowDragging(not hover and not mouseInSidebar())
+
+    if hover ~= drag.hover or (not search.processing and mouseInSidebar()) then
+
+        drag.hover = hover
 
         drawSidebar()
     end

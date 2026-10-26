@@ -289,7 +289,9 @@ function utf8.gfind(str, pattern)
 
                 si = n
 
-            elseif (pos + size - 1) == results[2] then
+            end
+
+            if (pos + size - 1) == results[2] then
 
                 li = n
 
